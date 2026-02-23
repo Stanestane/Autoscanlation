@@ -71,7 +71,7 @@ D:\ComicTranslator\
 ### Translate a Single Page
 
 ```powershell
-python translate_single_page.py "C:\Path\To\image.jpg"
+python translate_comic.py "C:\Path\To\image.jpg"
 
 ```
 
