@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+comic_translator_env/
+
+# Project Specific Data
+input/
+output/
