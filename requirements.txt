@@ -1,0 +1,18 @@
+# Core Machine Learning
+torch
+torchvision
+ultralytics
+transformers
+einops
+
+# Image Processing
+pillow
+opencv-python-headless
+numpy
+
+# Translation & OCR
+googletrans==4.0.0-rc1
+timm
+
+# Archive Handling
+patool
