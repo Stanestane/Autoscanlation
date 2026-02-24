@@ -13,3 +13,4 @@ comic_translator_env/
 # Project Specific Data
 input/
 output/
+models/
