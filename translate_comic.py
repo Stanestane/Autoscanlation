@@ -217,7 +217,7 @@ def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mas
         mid = (low + high) // 2
         current_font = base_font.font_variant(size=mid)
         bbox = draw.textbbox((0, 0), "Ay", font=current_font)
-        line_h = int((bbox[3] - bbox[1]) * 1.1)
+        line_h = int((bbox[3] - bbox[1]) * 0.9)
         current_strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h) if hull is not None else [(0,0,x2-x1,y2-y1)]
         
         if not current_strips:
@@ -288,28 +288,59 @@ def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mas
 
 def process_single_page(input_path: str | Path, subdir: Path = None):
     input_path = Path(input_path).resolve()
-    if not input_path.is_file(): return
+    if not input_path.is_file():
+        print(f"  Skip (not a file): {input_path.name}")
+        return
+
     try:
         image = Image.open(input_path).convert("RGB")
-    except: return
+    except Exception as e:
+        print(f"  Cannot open image {input_path.name}: {e}")
+        return
+
+    print(f"  → Detecting bubbles...", end="", flush=True)
     results = bubble_detector(input_path, verbose=False)
+
     edited_image = image.copy()
     bubble_count = 0
+
     for result in results:
         for i in range(len(result.boxes)):
-            if float(result.boxes.conf[i]) < MIN_CONFIDENCE: continue
+            conf = float(result.boxes.conf[i])
+            if conf < MIN_CONFIDENCE:
+                continue
             bubble_count += 1
+
             x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
             crop = image.crop((x1, y1, x2, y2))
+
             raw_text = ocr_with_florence(crop)
-            if not raw_text: continue
+            if not raw_text.strip():
+                continue
+
             translated = translate_text(raw_text)
-            #edited_image, bubble_mask = inpaint_bubble_text(edited_image, result, i, crop, bubble_count)
-            edited_image, bubble_mask = inpaint_bubble_text(edited_image, result, input_path.name, i)
-            edited_image = overlay_text(edited_image, translated, (x1, y1, x2, y2), bubble_mask)
+
+            edited_image, bubble_mask = inpaint_bubble_text(
+                edited_image, result, input_path.name, i
+            )
+
+            edited_image = overlay_text(
+                edited_image, translated, (x1, y1, x2, y2), bubble_mask
+            )
+
+    # Save
     save_dir = subdir if subdir else OUTPUT_DIR
     save_dir.mkdir(exist_ok=True, parents=True)
-    edited_image.save(save_dir / f"translated_{input_path.name}")
+
+    # Keep original extension
+    output_name = f"translated_{input_path.stem}{input_path.suffix}"
+    output_path = save_dir / output_name
+
+    try:
+        edited_image.save(output_path, quality=95 if input_path.suffix.lower() in {".jpg", ".jpeg"} else None)
+        print(f"  Saved: {output_name}")
+    except Exception as e:
+        print(f"  Failed to save {output_name}: {e}")
 
 def process_comic_archive(archive_path: str | Path):
     archive_path = Path(archive_path).resolve()
@@ -352,18 +383,122 @@ def repack_archive(original_path: Path, comic_output_dir: Path):
         shutil.rmtree(comic_output_dir)
     except Exception as e: print(f"Failed to create archive: {e}")
 
+# ────────────────────────────────────────────────────────────────
+#  Helper: Find all supported image files in a directory
+# ────────────────────────────────────────────────────────────────
+def get_image_files(directory: Path, recursive: bool = False) -> list[Path]:
+    """
+    Return sorted list of supported image files.
+    Supports recursive scanning if recursive=True.
+    """
+    extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff"}
+    pattern = "**/*" if recursive else "*"
+
+    files = [
+        p for p in directory.glob(pattern)
+        if p.is_file() and p.suffix.lower() in extensions
+    ]
+    return sorted(files)
+
+
+# ────────────────────────────────────────────────────────────────
+#  Helper: Find all comic archive files (.cbz / .cbr) in a directory
+# ────────────────────────────────────────────────────────────────
+def get_archive_files(directory: Path, recursive: bool = False) -> list[Path]:
+    """
+    Return sorted list of .cbz / .cbr files.
+    Supports recursive scanning if recursive=True.
+    """
+    extensions = {".cbz", ".cbr"}
+    pattern = "**/*" if recursive else "*"
+
+    files = [
+        p for p in directory.glob(pattern)
+        if p.is_file() and p.suffix.lower() in extensions
+    ]
+    return sorted(files)
+
+
+# ────────────────────────────────────────────────────────────────
+#  Main entry point – handles file / folder / archive intelligently
+# ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("path", type=str)
+    parser = argparse.ArgumentParser(
+        description="Manga/Comic Translator\n"
+                    "Supports: single image, .cbz/.cbr archive, or folder of images/archives\n"
+                    "Output goes to ./output/ with 'translated_' prefix"
+    )
+    parser.add_argument(
+        "path",
+        type=str,
+        help="Path to image file, .cbz/.cbr file, or folder containing them"
+    )
+    parser.add_argument(
+        "--recursive", "-r",
+        action="store_true",
+        help="If input is a folder, also process subfolders"
+    )
     args = parser.parse_args()
-    
+
     input_path = Path(args.path).resolve()
 
     if not input_path.exists():
-        print(f"Error: The input path '{input_path}' does not exist.")
-    elif input_path.suffix.lower() in [".cbr", ".cbz"]:
-        process_comic_archive(input_path)
-    elif input_path.is_file():
-        process_single_page(input_path)
+        print(f"Error: Path does not exist → {input_path}")
+        exit(1)
+
+    # ────── SINGLE FILE ──────
+    if input_path.is_file():
+        suffix = input_path.suffix.lower()
+
+        if suffix in {".cbz", ".cbr"}:
+            print(f"Processing comic archive → {input_path.name}")
+            process_comic_archive(input_path)
+
+        elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff"}:
+            print(f"Processing single image → {input_path.name}")
+            process_single_page(input_path)
+
+        else:
+            print(f"Unsupported file: {input_path.name} (extension: {suffix})")
+            print("Supported:")
+            print("  Images:   .jpg .jpeg .png .webp .bmp .gif .tiff")
+            print("  Archives: .cbz .cbr")
+            exit(1)
+
+    # ────── DIRECTORY ──────
+    elif input_path.is_dir():
+        print(f"Scanning directory → {input_path}")
+
+        archives = get_archive_files(input_path, recursive=args.recursive)
+        images   = get_image_files(input_path,   recursive=args.recursive)
+
+        if not archives and not images:
+            print("No supported files found (.jpg/.png/... or .cbz/.cbr)")
+            exit(1)
+
+        print(f"Found {len(archives)} archive(s) and {len(images)} image(s)")
+
+        # ─── Process archives first ───
+        if archives:
+            print("\nProcessing archives:")
+            for i, arch_path in enumerate(archives, 1):
+                print(f"  [{i}/{len(archives)}] {arch_path.name}")
+                process_comic_archive(arch_path)
+
+        # ─── Then loose images ───
+        if images:
+            print("\nProcessing loose images:")
+            # Output folder named after input folder
+            output_subdir = OUTPUT_DIR / input_path.name
+            output_subdir.mkdir(exist_ok=True, parents=True)
+
+            for i, img_path in enumerate(images, 1):
+                rel = img_path.relative_to(input_path)
+                print(f"  [{i:3d}/{len(images)}] {rel}")
+                process_single_page(img_path, subdir=output_subdir)
+
+        print(f"\nAll done. Results → {OUTPUT_DIR}")
+
     else:
-        print(f"Error: '{input_path}' is not a valid file.")
+        print(f"Error: Path is neither file nor directory → {input_path}")
+        exit(1)
