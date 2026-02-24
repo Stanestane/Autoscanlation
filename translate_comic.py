@@ -313,19 +313,34 @@ def process_single_page(input_path: str | Path, subdir: Path = None):
 
 def process_comic_archive(archive_path: str | Path):
     archive_path = Path(archive_path).resolve()
+    
+    if not archive_path.exists():
+        print(f"Error: Archive not found at {archive_path}")
+        return
+
     comic_output_dir = OUTPUT_DIR / archive_path.stem
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_dir_path = Path(temp_dir)
-        patoolib.extract_archive(str(archive_path), outdir=str(temp_dir_path), verbosity=-1)
-        image_files = sorted([f for f in temp_dir_path.rglob("*") if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}])
-        
-        total_pages = len(image_files)
-        for idx, img_path in enumerate(image_files, 1):
-            # Print current progress to the terminal
-            print(f"[{idx}/{total_pages}] Processing page: {img_path.name}")
-            process_single_page(img_path, subdir=comic_output_dir)
-        
-        repack_archive(archive_path, comic_output_dir)
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir_path = Path(temp_dir)
+            patoolib.extract_archive(str(archive_path), outdir=str(temp_dir_path), verbosity=-1)
+            
+            image_files = sorted([
+                f for f in temp_dir_path.rglob("*") 
+                if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+            ])
+            
+            if not image_files:
+                print(f"No valid images found in archive: {archive_path.name}")
+                return
+
+            total_pages = len(image_files)
+            for idx, img_path in enumerate(image_files, 1):
+                print(f"[{idx}/{total_pages}] Processing page: {img_path.name}")
+                process_single_page(img_path, subdir=comic_output_dir)
+            
+            repack_archive(archive_path, comic_output_dir)
+    except Exception as e:
+        print(f"An error occurred while processing the archive: {e}")
 
 def repack_archive(original_path: Path, comic_output_dir: Path):
     output_cbz = OUTPUT_DIR / f"{original_path.stem}_[{TARGET_LANG}].cbz"
@@ -341,6 +356,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("path", type=str)
     args = parser.parse_args()
-    input_path = Path(args.path)
-    if input_path.suffix.lower() in [".cbr", ".cbz"]: process_comic_archive(input_path)
-    else: process_single_page(input_path)
+    
+    input_path = Path(args.path).resolve()
+
+    if not input_path.exists():
+        print(f"Error: The input path '{input_path}' does not exist.")
+    elif input_path.suffix.lower() in [".cbr", ".cbz"]:
+        process_comic_archive(input_path)
+    elif input_path.is_file():
+        process_single_page(input_path)
+    else:
+        print(f"Error: '{input_path}' is not a valid file.")
