@@ -31,7 +31,6 @@ OUTPUT_DIR   = BASE_DIR / "output"
 #YOLO_PATH    = MODEL_DIR / "comic-speech-bubble-detector.pt"
 YOLO_PATH    = MODEL_DIR / "yolov8m-seg-speech-bubble.pt"
 FONT_PATH    = FONT_DIR / "animeace2_reg.otf"
-LAMA_CKPT    = MODEL_DIR / "lama_large_512px.ckpt" # Your file
 FONT_SIZE    = 24               # adjust depending on your page resolution
 MASK_DIR     = OUTPUT_DIR / "inspected_masks" # New directory for mask inspection
 
@@ -42,19 +41,10 @@ print(f"Using device: {DEVICE.upper()}")
 
 TARGET_LANG = "en"   # change to "fr", "es", "de", etc. as needed
 
-INPAINT_RADIUS    = 5
 MASK_MARGIN_PCT   = 0.14
 MIN_CONFIDENCE    = 0.25
 
 # ==================== LOAD MODELS ====================
-print(f"Initializing LaMa with {LAMA_CKPT.name}...")
-# This uses the local blueprint but your specific .ckpt weights
-try:
-    lama_model = SimpleLama(model_path=str(LAMA_CKPT), device=DEVICE)
-except Exception as e:
-    print(f"Manual load failed: {e}. Downloading default weights instead...")
-    lama_model = SimpleLama(device=DEVICE)
-
 print("Loading YOLO bubble detector...")
 bubble_detector = YOLO(YOLO_PATH)
 
@@ -69,15 +59,6 @@ florence_model = AutoModelForCausalLM.from_pretrained(
 
 print("Florence-2 loaded.")
 
-translator = Translator()
-
-bubble_detector = YOLO(YOLO_PATH)
-processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True)
-florence_model = AutoModelForCausalLM.from_pretrained(
-    "microsoft/Florence-2-large",
-    trust_remote_code=True,
-    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
-).to(DEVICE).eval()
 translator = Translator()
 
 def ocr_with_florence(cropped_img: Image.Image) -> str:
@@ -168,7 +149,7 @@ def inpaint_bubble_text(image: Image.Image, result, page_name: str, index: int) 
     for c in range(3):
         img_np[:, :, c] = (img_np[:, :, c] * (1 - mask_float) + white_layer[:, :, c] * mask_float).astype(np.uint8)
     
-    return Image.fromarray(img_np), border_protection
+    return Image.fromarray(img_np), full_mask
 
 def largest_inscribed_rectangle(mask: np.ndarray) -> tuple[int, int, int, int]:
     if mask.size == 0 or np.sum(mask) == 0:
