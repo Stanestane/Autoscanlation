@@ -14,10 +14,6 @@ import zipfile
 import patoolib  # for .cbr support
 import shutil
 import tempfile
-from simple_lama_inpainting import SimpleLama
-
-
-lama_model = SimpleLama()
 
 # Silence some common warnings
 warnings.filterwarnings("ignore", category=UserWarning)
