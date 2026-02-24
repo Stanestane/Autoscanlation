@@ -14,6 +14,10 @@ import zipfile
 import patoolib  # for .cbr support
 import shutil
 import tempfile
+from simple_lama_inpainting import SimpleLama
+
+
+lama_model = SimpleLama()
 
 # Silence some common warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -27,7 +31,9 @@ OUTPUT_DIR   = BASE_DIR / "output"
 #YOLO_PATH    = MODEL_DIR / "comic-speech-bubble-detector.pt"
 YOLO_PATH    = MODEL_DIR / "yolov8m-seg-speech-bubble.pt"
 FONT_PATH    = FONT_DIR / "animeace2_reg.otf"
+LAMA_CKPT    = MODEL_DIR / "lama_large_512px.ckpt" # Your file
 FONT_SIZE    = 24               # adjust depending on your page resolution
+MASK_DIR     = OUTPUT_DIR / "inspected_masks" # New directory for mask inspection
 
 FLORENCE_MODEL_ID = "microsoft/Florence-2-large"   # or "microsoft/Florence-2-base" for faster/less VRAM
 
@@ -38,9 +44,17 @@ TARGET_LANG = "en"   # change to "fr", "es", "de", etc. as needed
 
 INPAINT_RADIUS    = 5
 MASK_MARGIN_PCT   = 0.14
-MIN_CONFIDENCE    = 0.12
+MIN_CONFIDENCE    = 0.25
 
 # ==================== LOAD MODELS ====================
+print(f"Initializing LaMa with {LAMA_CKPT.name}...")
+# This uses the local blueprint but your specific .ckpt weights
+try:
+    lama_model = SimpleLama(model_path=str(LAMA_CKPT), device=DEVICE)
+except Exception as e:
+    print(f"Manual load failed: {e}. Downloading default weights instead...")
+    lama_model = SimpleLama(device=DEVICE)
+
 print("Loading YOLO bubble detector...")
 bubble_detector = YOLO(YOLO_PATH)
 
@@ -57,7 +71,15 @@ print("Florence-2 loaded.")
 
 translator = Translator()
 
-# ==================== FUNCTIONS ====================
+bubble_detector = YOLO(YOLO_PATH)
+processor = AutoProcessor.from_pretrained("microsoft/Florence-2-large", trust_remote_code=True)
+florence_model = AutoModelForCausalLM.from_pretrained(
+    "microsoft/Florence-2-large",
+    trust_remote_code=True,
+    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
+).to(DEVICE).eval()
+translator = Translator()
+
 def ocr_with_florence(cropped_img: Image.Image) -> str:
     try:
         inputs = processor(
@@ -103,39 +125,50 @@ def translate_text(text: str) -> str:
         print(f"Translation failed: {e}")
         return text  # keep original if failed
 
-def inpaint_bubble_text(image: Image.Image, result, index: int, original_crop: Image.Image, bubble_count: int) -> tuple[Image.Image, np.ndarray | None]:
-    if image is None:
-        print(f"Bubble {bubble_count}: Input image is None")
-        return image, None
+def inpaint_bubble_text(image: Image.Image, result, page_name: str, index: int) -> tuple[Image.Image, np.ndarray]:
+    if result.masks is None: return image, None
+    
+    # 1. Get the YOLO bubble area
+    full_mask = np.zeros((image.height, image.width), dtype=np.uint8)
+    pts = result.masks.xy[index].astype(np.int32).reshape((-1, 1, 2))
+    cv2.fillPoly(full_mask, [pts], 255)
+    
+    # 2. Identify the Text (Ink)
+    img_np = np.array(image.convert("RGB"))
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    
+    # Slightly higher threshold (150) to catch those "faint" smudges
+    _, dark_pixels = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    
+    # 3. Protect the Border & Isolate Text
+    # We shrink the bubble area so the white paint never touches the black outline
+    border_protection = cv2.erode(full_mask, np.ones((9,9), np.uint8), iterations=2)
+    
+    # Only target dark pixels inside the safe zone
+    final_mask = cv2.bitwise_and(dark_pixels, border_protection)
+    
+    # 4. Expand and Feather (The "Smudge Killer")
+    # We grow the mask to fully cover the text's anti-aliased edges
+    final_mask = cv2.dilate(final_mask, np.ones((5,5), np.uint8), iterations=2)
+    
+    # Apply a Gaussian Blur to the mask to make the white fill blend softly
+    # This prevents "harsh" white edges inside the bubble
+    mask_blurred = cv2.GaussianBlur(final_mask, (7, 7), 0)
 
-    if result.masks is None or result.masks.xy is None or len(result.masks.xy) <= index:
-        print(f"Bubble {bubble_count}: No valid mask – using fallback")
-        x1, y1, x2, y2 = map(int, result.boxes.xyxy[index])
-        full_mask = np.zeros((image.height, image.width), dtype=np.uint8)
-        cv2.rectangle(full_mask, (x1+10, y1+10), (x2-10, y2-10), 255, -1)
-    else:
-        contour = result.masks.xy[index]
-        if len(contour) < 3:
-            return image, None
+    # Save for inspection
+    #MASK_DIR.mkdir(exist_ok=True, parents=True)
+    #cv2.imwrite(str(MASK_DIR / f"mask_{page_name}_bubble_{index}.png"), final_mask)
 
-        full_mask = np.zeros((image.height, image.width), dtype=np.uint8)
-        pts = contour.astype(np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(full_mask, [pts], 255)
-
-    # Soft blur + contraction
-    full_mask = cv2.GaussianBlur(full_mask, (9, 9), 0)
-    kernel = np.ones((7, 7), np.uint8)
-    full_mask = cv2.erode(full_mask, kernel, iterations=2)
-
-    # Soft white fill
-    alpha = full_mask.astype(np.float32) / 255.0
-    img_np = np.array(image).astype(np.float32)
-    white = np.array([255, 255, 255], dtype=np.float32)
-    blended = (1 - alpha[..., np.newaxis]) * img_np + alpha[..., np.newaxis] * white
-    blended = np.clip(blended, 0, 255).astype(np.uint8)
-
-    cleaned_image = Image.fromarray(blended)
-    return cleaned_image, full_mask
+    # 5. Paint it White
+    # We use the blurred mask as an alpha channel to blend white onto the image
+    mask_float = mask_blurred.astype(float) / 255.0
+    white_layer = np.full(img_np.shape, 255, dtype=np.uint8)
+    
+    # Blend: result = (image * (1 - mask)) + (white * mask)
+    for c in range(3):
+        img_np[:, :, c] = (img_np[:, :, c] * (1 - mask_float) + white_layer[:, :, c] * mask_float).astype(np.uint8)
+    
+    return Image.fromarray(img_np), border_protection
 
 def largest_inscribed_rectangle(mask: np.ndarray) -> tuple[int, int, int, int]:
     if mask.size == 0 or np.sum(mask) == 0:
@@ -294,7 +327,8 @@ def process_single_page(input_path: str | Path, subdir: Path = None):
             raw_text = ocr_with_florence(crop)
             if not raw_text: continue
             translated = translate_text(raw_text)
-            edited_image, bubble_mask = inpaint_bubble_text(edited_image, result, i, crop, bubble_count)
+            #edited_image, bubble_mask = inpaint_bubble_text(edited_image, result, i, crop, bubble_count)
+            edited_image, bubble_mask = inpaint_bubble_text(edited_image, result, input_path.name, i)
             edited_image = overlay_text(edited_image, translated, (x1, y1, x2, y2), bubble_mask)
     save_dir = subdir if subdir else OUTPUT_DIR
     save_dir.mkdir(exist_ok=True, parents=True)
