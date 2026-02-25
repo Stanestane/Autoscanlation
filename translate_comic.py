@@ -194,7 +194,7 @@ def get_text_strips_from_convex_hull(hull: np.ndarray, mask_crop: np.ndarray, st
             strips.append((x, y_start + y, w, h))
     return strips
 
-def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mask: np.ndarray | None = None, padding: int = 2, font_size: int = None) -> Image.Image:
+def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mask: np.ndarray | None = None, padding: int = 8, font_size: int = None) -> Image.Image:
     if not text.strip():
         return image
     
@@ -250,18 +250,38 @@ def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mas
         # If text is too long for the bubble, we still use best_font and best_lines 
         # (it will just be cut off rather than guessing a new size).
     else:
-        # PATH: AUTO-FIT (Original Binary Search)
+        # PATH: AUTO-FIT (Binary Search)
         low, high = 8, FONT_SIZE * 2
+        
+        if hull is not None:
+            hx, hy, hw, hh = cv2.boundingRect(hull)
+            
+            # Calculate a narrower safe width (e.g., 80% of max width)
+            # to account for the tapering of the bubble at the top/bottom.
+            safe_w = int(hw * 0.8) 
+            safe_x = hx + (hw - safe_w) // 2
+            
+            # This fallback is much safer than the full bounding box width
+            fallback_strips = [(safe_x, hy, safe_w, hh)]
+            max_allowed_h = hh
+        else:
+            # If no hull exists, use a standard 15% margin
+            margin_w = int((x2 - x1) * 0.15)
+            fallback_strips = [(margin_w, 0, (x2 - x1) - 2 * margin_w, (y2 - y1))]
+            max_allowed_h = (y2 - y1) * 0.8
+
         while low <= high:
             mid = (low + high) // 2
             current_font = base_font.font_variant(size=mid)
             bbox = draw.textbbox((0, 0), "Ay", font=current_font)
             line_h = int((bbox[3] - bbox[1]) * 0.9)
-            current_strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h) if hull is not None else [(0,0,x2-x1,y2-y1)]
             
+            # Try hull strips first
+            current_strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h) if hull is not None else []
+            
+            # If hull strips fail (too narrow), use our centered safe fallback
             if not current_strips:
-                high = mid - 1
-                continue
+                current_strips = fallback_strips
             
             words, temp_lines, word_idx = text.split(), [], 0
             for (sx, sy, sw, sh) in current_strips:
@@ -275,14 +295,23 @@ def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mas
                 if line_words:
                     temp_lines.append({"text": " ".join(line_words), "x": sx, "y": sy, "w": sw, "h": line_h})
             
-            if word_idx >= len(words):
+            # Strict height check
+            total_text_h = (temp_lines[-1]["y"] + temp_lines[-1]["h"]) - temp_lines[0]["y"] if temp_lines else 0
+
+            if word_idx >= len(words) and total_text_h <= max_allowed_h:
                 best_font, best_lines, low = current_font, temp_lines, mid + 1
             else:
                 high = mid - 1
 
     # --- 2. RENDERING ---
-    # Only use fallback if we have NO lines at all and NO user-specified font size
+    
+    # DEBUG: Always draw hull (Magenta)
+    #if hull is not None:
+    #    global_hull = hull + np.array([x1, y1])
+    #    draw.polygon([tuple(p) for p in global_hull], outline="magenta", width=2)
+
     if not best_lines and not font_size:
+        # Fallback logic for total failure
         if hull is not None:
             bubble_area = cv2.contourArea(hull)
             char_count = len(text) if len(text) > 0 else 1
@@ -295,19 +324,35 @@ def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mas
         draw.text((x1 + padding, y1 + padding), text, font=fb_font, fill="black")
     
     elif best_lines:
-        # Calculate centering based on the actual lines generated
+        # Vertical centering math
         text_top = best_lines[0]["y"]
         text_bottom = best_lines[-1]["y"] + best_lines[-1]["h"]
         actual_text_height = text_bottom - text_top
         v_shift = ((y2 - y1) // 2) - (text_top + (actual_text_height // 2))
 
         for line in best_lines:
-            line_w = draw.textbbox((0, 0), line["text"], font=best_font)[2]
-            # Center the line horizontally within its specific hull strip
-            fx = x1 + line["x"] + (line["w"] - line_w) // 2
-            fy = y1 + line["y"] + v_shift
+            # Measure exact text bounds to fix alignment
+            # bbox returns (left, top, right, bottom) relative to (0,0)
+            t_bbox = draw.textbbox((0, 0), line["text"], font=best_font)
+            t_w = t_bbox[2] - t_bbox[0]
+            t_offset_y = t_bbox[1]  # This is the 'drift' factor
             
-            # White outline for legibility
+            # Horizontal center within the strip
+            fx = x1 + line["x"] + (line["w"] - t_w) // 2
+            
+            # Vertical position: Strip Y + global Shift - the font's internal top offset
+            fy = y1 + line["y"] + v_shift - t_offset_y
+            
+            # --- DEBUG: DRAW TEXT STRIP BOXES (Cyan) ---
+            #strip_rect = [
+            #    x1 + line["x"], 
+            #    y1 + line["y"] + v_shift, 
+            #    x1 + line["x"] + line["w"], 
+            #    y1 + line["y"] + v_shift + line["h"]
+            #]
+            #draw.rectangle(strip_rect, outline="cyan", width=1)
+            
+            # Draw actual text with outline
             for dx, dy in [(-1,-1), (1,-1), (-1,1), (1,1)]:
                 draw.text((fx+dx, fy+dy), line["text"], font=best_font, fill="white")
             draw.text((fx, fy), line["text"], font=best_font, fill="black")
