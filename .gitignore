@@ -14,3 +14,4 @@ comic_translator_env/
 input/
 output/
 models/
+basicsr/
