@@ -194,11 +194,13 @@ def get_text_strips_from_convex_hull(hull: np.ndarray, mask_crop: np.ndarray, st
             strips.append((x, y_start + y, w, h))
     return strips
 
-def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mask: np.ndarray | None = None, padding: int = 2) -> Image.Image:
+def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mask: np.ndarray | None = None, padding: int = 2, font_size: int = None) -> Image.Image:
     if not text.strip():
         return image
+    
     draw = ImageDraw.Draw(image)
     x1, y1, x2, y2 = box
+    
     try:
         base_font = ImageFont.truetype(str(FONT_PATH), FONT_SIZE)
     except Exception:
@@ -211,82 +213,108 @@ def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mas
         if np.any(mask_crop):
             hull = convex_hull_contour(mask_crop)
 
-    low, high = 8, FONT_SIZE * 2
-    best_font, best_lines = base_font, []
-    while low <= high:
-        mid = (low + high) // 2
-        current_font = base_font.font_variant(size=mid)
-        bbox = draw.textbbox((0, 0), "Ay", font=current_font)
+    best_font = None
+    best_lines = []
+
+    # --- 1. DETERMINATION OF FONT SIZE & LINES ---
+    if font_size:
+        best_font = base_font.font_variant(size=font_size)
+        bbox = draw.textbbox((0, 0), "Ay", font=best_font)
         line_h = int((bbox[3] - bbox[1]) * 0.9)
-        current_strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h) if hull is not None else [(0,0,x2-x1,y2-y1)]
         
-        if not current_strips:
-            high = mid - 1
-            continue
+        # Try to get strips from hull
+        strips = []
+        if hull is not None:
+            strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h)
         
-        words, temp_lines, word_idx = text.split(), [], 0
-        for (sx, sy, sw, sh) in current_strips:
+        # FALLBACK: If hull strips fail or no hull, use the rectangular bounding box
+        if not strips:
+            strips = [(0, 0, x2 - x1, y2 - y1)]
+        
+        words, word_idx = text.split(), 0
+        for (sx, sy, sw, sh) in strips:
             if word_idx >= len(words): break
             line_words = []
             while word_idx < len(words):
                 test_line = " ".join(line_words + [words[word_idx]])
-                if draw.textbbox((0, 0), test_line, font=current_font)[2] <= (sw - (padding * 2)):
+                if draw.textbbox((0, 0), test_line, font=best_font)[2] <= (sw - (padding * 2)):
                     line_words.append(words[word_idx]); word_idx += 1
                 else: break
+            
             if line_words:
-                temp_lines.append({"text": " ".join(line_words), "x": sx, "y": sy, "w": sw, "h": line_h})
-        
-        if word_idx >= len(words):
-            best_font, best_lines, low = current_font, temp_lines, mid + 1
-        else:
-            high = mid - 1
+                best_lines.append({"text": " ".join(line_words), "x": sx, "y": sy, "w": sw, "h": line_h})
+            elif not best_lines and word_idx < len(words):
+                # Force at least one word if the strip is too narrow, preventing silent failure
+                best_lines.append({"text": words[word_idx], "x": sx, "y": sy, "w": sw, "h": line_h})
+                word_idx += 1
+        # If text is too long for the bubble, we still use best_font and best_lines 
+        # (it will just be cut off rather than guessing a new size).
+    else:
+        # PATH: AUTO-FIT (Original Binary Search)
+        low, high = 8, FONT_SIZE * 2
+        while low <= high:
+            mid = (low + high) // 2
+            current_font = base_font.font_variant(size=mid)
+            bbox = draw.textbbox((0, 0), "Ay", font=current_font)
+            line_h = int((bbox[3] - bbox[1]) * 0.9)
+            current_strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h) if hull is not None else [(0,0,x2-x1,y2-y1)]
+            
+            if not current_strips:
+                high = mid - 1
+                continue
+            
+            words, temp_lines, word_idx = text.split(), [], 0
+            for (sx, sy, sw, sh) in current_strips:
+                if word_idx >= len(words): break
+                line_words = []
+                while word_idx < len(words):
+                    test_line = " ".join(line_words + [words[word_idx]])
+                    if draw.textbbox((0, 0), test_line, font=current_font)[2] <= (sw - (padding * 2)):
+                        line_words.append(words[word_idx]); word_idx += 1
+                    else: break
+                if line_words:
+                    temp_lines.append({"text": " ".join(line_words), "x": sx, "y": sy, "w": sw, "h": line_h})
+            
+            if word_idx >= len(words):
+                best_font, best_lines, low = current_font, temp_lines, mid + 1
+            else:
+                high = mid - 1
 
-    if not best_lines:
-        # 1. Calculate the area of the bubble using the hull
+    # --- 2. RENDERING ---
+    # Only use fallback if we have NO lines at all and NO user-specified font size
+    if not best_lines and not font_size:
         if hull is not None:
-            # cv2.contourArea gives the number of pixels inside the shape
             bubble_area = cv2.contourArea(hull)
-            
-            # 2. Estimate font size based on area 
-            # We assume a character is roughly square. 
-            # Total area / number of characters = area per character
             char_count = len(text) if len(text) > 0 else 1
-            area_per_char = bubble_area / char_count
-            
-            # The square root of the area per character gives a rough font size
-            # We add a 0.7 multiplier to account for word-wrap gaps
-            estimated_size = int(np.sqrt(area_per_char) * 0.7)
-            
-            # 3. Constrain the size (don't go below 6 or above 14 for fallback)
+            estimated_size = int(np.sqrt(bubble_area / char_count) * 0.7)
             fallback_size = max(6, min(estimated_size, 14))
         else:
             fallback_size = 10
             
-        fallback_font = base_font.font_variant(size=fallback_size)
-        
-        # Draw the full text in the top-left of the bubble with a red outline
-        # so you know the auto-fitting failed for this specific bubble.
-        for dx, dy in [(-1,-1), (1,-1), (-1,1), (1,1)]:
-            draw.text((x1 + padding + dx, y1 + padding + dy), text, font=fallback_font, fill="white")
-        draw.text((x1 + padding, y1 + padding), text, font=fallback_font, fill="black")
-    else:
+        fb_font = base_font.font_variant(size=fallback_size)
+        draw.text((x1 + padding, y1 + padding), text, font=fb_font, fill="black")
+    
+    elif best_lines:
+        # Calculate centering based on the actual lines generated
         text_top = best_lines[0]["y"]
         text_bottom = best_lines[-1]["y"] + best_lines[-1]["h"]
         actual_text_height = text_bottom - text_top
-        bubble_height = (y2 - y1 - line_h)
-        v_shift = (bubble_height // 2) - (text_top + (actual_text_height // 2))
+        v_shift = ((y2 - y1) // 2) - (text_top + (actual_text_height // 2))
 
         for line in best_lines:
             line_w = draw.textbbox((0, 0), line["text"], font=best_font)[2]
+            # Center the line horizontally within its specific hull strip
             fx = x1 + line["x"] + (line["w"] - line_w) // 2
             fy = y1 + line["y"] + v_shift
+            
+            # White outline for legibility
             for dx, dy in [(-1,-1), (1,-1), (-1,1), (1,1)]:
                 draw.text((fx+dx, fy+dy), line["text"], font=best_font, fill="white")
             draw.text((fx, fy), line["text"], font=best_font, fill="black")
 
     return image
 
-def process_single_page(input_path: str | Path, subdir: Path = None):
+def process_single_page(input_path: str | Path, subdir: Path = None, font_size: int = None):
     input_path = Path(input_path).resolve()
     if not input_path.is_file():
         print(f"  Skip (not a file): {input_path.name}")
@@ -325,7 +353,7 @@ def process_single_page(input_path: str | Path, subdir: Path = None):
             )
 
             edited_image = overlay_text(
-                edited_image, translated, (x1, y1, x2, y2), bubble_mask
+                edited_image, translated, (x1, y1, x2, y2), bubble_mask, font_size=font_size
             )
 
     # Save
@@ -342,7 +370,7 @@ def process_single_page(input_path: str | Path, subdir: Path = None):
     except Exception as e:
         print(f"  Failed to save {output_name}: {e}")
 
-def process_comic_archive(archive_path: str | Path):
+def process_comic_archive(archive_path: str | Path, font_size: int = None):
     archive_path = Path(archive_path).resolve()
     
     if not archive_path.exists():
@@ -367,7 +395,7 @@ def process_comic_archive(archive_path: str | Path):
             total_pages = len(image_files)
             for idx, img_path in enumerate(image_files, 1):
                 print(f"[{idx}/{total_pages}] Processing page: {img_path.name}")
-                process_single_page(img_path, subdir=comic_output_dir)
+                process_single_page(img_path, subdir=comic_output_dir, font_size=font_size)
             
             repack_archive(archive_path, comic_output_dir)
     except Exception as e:
@@ -438,6 +466,13 @@ if __name__ == "__main__":
         action="store_true",
         help="If input is a folder, also process subfolders"
     )
+    parser.add_argument(
+        "--font-size", "-f",
+        type=int,
+        default=None,
+        help="Manual font size. If set, skips auto-guessing."
+    )
+    args = parser.parse_args()
     args = parser.parse_args()
 
     input_path = Path(args.path).resolve()
@@ -452,11 +487,11 @@ if __name__ == "__main__":
 
         if suffix in {".cbz", ".cbr"}:
             print(f"Processing comic archive → {input_path.name}")
-            process_comic_archive(input_path)
+            process_comic_archive(input_path, font_size=args.font_size)
 
         elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff"}:
             print(f"Processing single image → {input_path.name}")
-            process_single_page(input_path)
+            process_single_page(input_path, font_size=args.font_size)
 
         else:
             print(f"Unsupported file: {input_path.name} (extension: {suffix})")
@@ -483,7 +518,7 @@ if __name__ == "__main__":
             print("\nProcessing archives:")
             for i, arch_path in enumerate(archives, 1):
                 print(f"  [{i}/{len(archives)}] {arch_path.name}")
-                process_comic_archive(arch_path)
+                process_comic_archive(arch_path, font_size=args.font_size)
 
         # ─── Then loose images ───
         if images:
@@ -495,7 +530,7 @@ if __name__ == "__main__":
             for i, img_path in enumerate(images, 1):
                 rel = img_path.relative_to(input_path)
                 print(f"  [{i:3d}/{len(images)}] {rel}")
-                process_single_page(img_path, subdir=output_subdir)
+                process_single_page(img_path, subdir=output_subdir, font_size=args.font_size)
 
         print(f"\nAll done. Results → {OUTPUT_DIR}")
 
