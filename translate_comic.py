@@ -57,15 +57,14 @@ print("Florence-2 loaded.")
 
 translator = Translator()
 
-def ocr_with_florence(cropped_img: Image.Image) -> str:
+def ocr_and_estimate_size(cropped_img: Image.Image) -> tuple[str, int]:
     try:
         inputs = processor(
-            text="<OCR>",
+            text="<OCR_WITH_REGION>",
             images=cropped_img,
             return_tensors="pt"
         )
 
-        # Move everything to correct device & dtype
         input_ids = inputs["input_ids"].to(DEVICE)
         pixel_values = inputs["pixel_values"].to(DEVICE)
         if DEVICE == "cuda":
@@ -82,15 +81,60 @@ def ocr_with_florence(cropped_img: Image.Image) -> str:
         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
         parsed = processor.post_process_generation(
             generated_text,
-            task="<OCR>",
+            task="<OCR_WITH_REGION>",
             image_size=(cropped_img.width, cropped_img.height)
         )
 
-        text = parsed.get("<OCR>", "") if isinstance(parsed, dict) else (parsed if isinstance(parsed, str) else "")
-        return text.strip()
+        result = parsed.get("<OCR_WITH_REGION>", {})
+        quad_boxes = result.get('quad_boxes', [])
+        labels    = result.get('labels', [])
+
+        # ── Clean text ───────────────────────────────────────────────────────
+        cleaned_labels = []
+        for lbl in labels:
+            if not isinstance(lbl, str):
+                continue
+            lbl = lbl.strip()
+            if not lbl:
+                continue
+            # Remove Florence tokens
+            for token in ["<s>", "</s>", "<pad>"]:
+                lbl = lbl.replace(token, "")
+            # Skip pure location tags
+            if lbl.startswith("<loc") and lbl.endswith(">"):
+                continue
+            # Remove any remaining short tag-like strings
+            if len(lbl) < 3 and "<" in lbl and ">" in lbl:
+                continue
+            lbl = lbl.strip()
+            if lbl:
+                cleaned_labels.append(lbl)
+
+        raw_text = '\n'.join(cleaned_labels).strip()
+
+        # ── Font size estimation (unchanged) ───────────────────────────────
+        heights = []
+        for box in quad_boxes:
+            if len(box) == 8:
+                ys = box[1::2]
+                height = max(ys) - min(ys)
+                if height > 5:
+                    heights.append(height)
+
+        if heights:
+            avg_height = sum(heights) / len(heights)
+            est_size = int(avg_height * 0.88)
+            est_size = max(12, min(est_size, 60))
+        else:
+            est_size = FONT_SIZE
+
+        return raw_text, est_size
+
     except Exception as e:
-        print(f"OCR error: {e}")
-        return ""
+        print(f"Florence error: {e}")
+        return "", FONT_SIZE
+
+
 
 def translate_text(text: str) -> str:
     if not text:
@@ -194,12 +238,14 @@ def get_text_strips_from_convex_hull(hull: np.ndarray, mask_crop: np.ndarray, st
             strips.append((x, y_start + y, w, h))
     return strips
 
-def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mask: np.ndarray | None = None, padding: int = 8, font_size: int = None) -> Image.Image:
+def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mask: np.ndarray | None = None, padding: int = 12, font_size: int = None) -> Image.Image:
     if not text.strip():
         return image
     
     draw = ImageDraw.Draw(image)
     x1, y1, x2, y2 = box
+    bubble_w = x2 - x1
+    bubble_h = y2 - y1
     
     try:
         base_font = ImageFont.truetype(str(FONT_PATH), FONT_SIZE)
@@ -213,148 +259,130 @@ def overlay_text(image: Image.Image, text: str, box: tuple[int,int,int,int], mas
         if np.any(mask_crop):
             hull = convex_hull_contour(mask_crop)
 
-    best_font = None
+    # ────────────────────────────────────────────────────────────────
+    #  Fixed font size — either user-provided or Florence-estimated
+    # ────────────────────────────────────────────────────────────────
+    effective_font_size = font_size if font_size is not None else FONT_SIZE
+
+    best_font = base_font.font_variant(size=effective_font_size)
+    bbox = draw.textbbox((0, 0), "Ay", font=best_font)
+    line_h = int((bbox[3] - bbox[1]) * 1.15)  # safety
+
+    # Safe horizontal area (with padding)
+    safe_left   = padding
+    safe_right  = bubble_w - padding
+    safe_width  = safe_right - safe_left
+
+    # ────────────────────────────────────────────────────────────────
+    #  Try to get initial strips from convex hull (good for irregular bubbles)
+    # ────────────────────────────────────────────────────────────────
+    strips = []
+    if hull is not None:
+        strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h)
+
+    # ────────────────────────────────────────────────────────────────
+    #  Build lines — first try hull strips, then continue stacking downward
+    # ────────────────────────────────────────────────────────────────
     best_lines = []
+    words = text.split()
+    word_idx = 0
 
-    # --- 1. DETERMINATION OF FONT SIZE & LINES ---
-    if font_size:
-        best_font = base_font.font_variant(size=font_size)
-        bbox = draw.textbbox((0, 0), "Ay", font=best_font)
-        line_h = int((bbox[3] - bbox[1]) * 0.9)
-        
-        # Try to get strips from hull
-        strips = []
-        if hull is not None:
-            strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h)
-        
-        # FALLBACK: If hull strips fail or no hull, use the rectangular bounding box
-        if not strips:
-            strips = [(0, 0, x2 - x1, y2 - y1)]
-        
-        words, word_idx = text.split(), 0
-        for (sx, sy, sw, sh) in strips:
-            if word_idx >= len(words): break
-            line_words = []
-            while word_idx < len(words):
-                test_line = " ".join(line_words + [words[word_idx]])
-                if draw.textbbox((0, 0), test_line, font=best_font)[2] <= (sw - (padding * 2)):
-                    line_words.append(words[word_idx]); word_idx += 1
-                else: break
-            
-            if line_words:
-                best_lines.append({"text": " ".join(line_words), "x": sx, "y": sy, "w": sw, "h": line_h})
-            elif not best_lines and word_idx < len(words):
-                # Force at least one word if the strip is too narrow, preventing silent failure
-                best_lines.append({"text": words[word_idx], "x": sx, "y": sy, "w": sw, "h": line_h})
+    # Phase 1: use hull-based strips if available
+    current_y = 0
+    for strip in strips:
+        if word_idx >= len(words):
+            break
+        sx, sy, sw, sh = strip
+        # Use strip's own safe width if narrower
+        line_safe_w = min(sw - padding * 2, safe_width)
+
+        line_words = []
+        while word_idx < len(words):
+            test_line = " ".join(line_words + [words[word_idx]])
+            line_w = draw.textbbox((0, 0), test_line, font=best_font)[2]
+            if line_w <= line_safe_w:
+                line_words.append(words[word_idx])
                 word_idx += 1
-        # If text is too long for the bubble, we still use best_font and best_lines 
-        # (it will just be cut off rather than guessing a new size).
-    else:
-        # PATH: AUTO-FIT (Binary Search)
-        low, high = 8, FONT_SIZE * 2
-        
-        if hull is not None:
-            hx, hy, hw, hh = cv2.boundingRect(hull)
-            
-            # Calculate a narrower safe width (e.g., 80% of max width)
-            # to account for the tapering of the bubble at the top/bottom.
-            safe_w = int(hw * 0.8) 
-            safe_x = hx + (hw - safe_w) // 2
-            
-            # This fallback is much safer than the full bounding box width
-            fallback_strips = [(safe_x, hy, safe_w, hh)]
-            max_allowed_h = hh
-        else:
-            # If no hull exists, use a standard 15% margin
-            margin_w = int((x2 - x1) * 0.15)
-            fallback_strips = [(margin_w, 0, (x2 - x1) - 2 * margin_w, (y2 - y1))]
-            max_allowed_h = (y2 - y1) * 0.8
-
-        while low <= high:
-            mid = (low + high) // 2
-            current_font = base_font.font_variant(size=mid)
-            bbox = draw.textbbox((0, 0), "Ay", font=current_font)
-            line_h = int((bbox[3] - bbox[1]) * 0.9)
-            
-            # Try hull strips first
-            current_strips = get_text_strips_from_convex_hull(hull, mask_crop, strip_height=line_h) if hull is not None else []
-            
-            # If hull strips fail (too narrow), use our centered safe fallback
-            if not current_strips:
-                current_strips = fallback_strips
-            
-            words, temp_lines, word_idx = text.split(), [], 0
-            for (sx, sy, sw, sh) in current_strips:
-                if word_idx >= len(words): break
-                line_words = []
-                while word_idx < len(words):
-                    test_line = " ".join(line_words + [words[word_idx]])
-                    if draw.textbbox((0, 0), test_line, font=current_font)[2] <= (sw - (padding * 2)):
-                        line_words.append(words[word_idx]); word_idx += 1
-                    else: break
-                if line_words:
-                    temp_lines.append({"text": " ".join(line_words), "x": sx, "y": sy, "w": sw, "h": line_h})
-            
-            # Strict height check
-            total_text_h = (temp_lines[-1]["y"] + temp_lines[-1]["h"]) - temp_lines[0]["y"] if temp_lines else 0
-
-            if word_idx >= len(words) and total_text_h <= max_allowed_h:
-                best_font, best_lines, low = current_font, temp_lines, mid + 1
             else:
-                high = mid - 1
+                break
 
-    # --- 2. RENDERING ---
-    
-    # DEBUG: Always draw hull (Magenta)
-    #if hull is not None:
-    #    global_hull = hull + np.array([x1, y1])
-    #    draw.polygon([tuple(p) for p in global_hull], outline="magenta", width=2)
+        if line_words:
+            line_text = " ".join(line_words)
+            best_lines.append({
+                "text": line_text,
+                "x": sx + (sw - draw.textbbox((0, 0), line_text, font=best_font)[2]) // 2,
+                "y": sy,
+            })
 
-    if not best_lines and not font_size:
-        # Fallback logic for total failure
-        if hull is not None:
-            bubble_area = cv2.contourArea(hull)
-            char_count = len(text) if len(text) > 0 else 1
-            estimated_size = int(np.sqrt(bubble_area / char_count) * 0.7)
-            fallback_size = max(6, min(estimated_size, 14))
+        current_y = max(current_y, sy + line_h)
+
+    # Phase 2: if words remain, keep stacking centered lines downward
+    fallback_y = current_y if current_y > 0 else padding
+    while word_idx < len(words):
+        line_words = []
+        while word_idx < len(words):
+            test_line = " ".join(line_words + [words[word_idx]])
+            line_w = draw.textbbox((0, 0), test_line, font=best_font)[2]
+            if line_w <= safe_width:
+                line_words.append(words[word_idx])
+                word_idx += 1
+            else:
+                break
+
+        if not line_words and word_idx < len(words):
+            # Force single word if too long for line
+            line_words = [words[word_idx]]
+            word_idx += 1
+
+        if line_words:
+            line_text = " ".join(line_words)
+            line_x = safe_left + (safe_width - draw.textbbox((0, 0), line_text, font=best_font)[2]) // 2
+            best_lines.append({
+                "text": line_text,
+                "x": line_x,
+                "y": fallback_y,
+            })
+            fallback_y += line_h
+
+    # ────────────────────────────────────────────────────────────────
+    #  Vertical centering of the whole block (or top-aligned if very tall)
+    # ────────────────────────────────────────────────────────────────
+    if best_lines:
+        first_y = best_lines[0]["y"]
+        last_y  = best_lines[-1]["y"] + line_h
+        text_block_h = last_y - first_y
+
+        if text_block_h < bubble_h * 0.9:
+            # Center if it comfortably fits
+            v_shift = (bubble_h - text_block_h) // 2 - first_y
         else:
-            fallback_size = 10
-            
-        fb_font = base_font.font_variant(size=fallback_size)
-        draw.text((x1 + padding, y1 + padding), text, font=fb_font, fill="black")
-    
-    elif best_lines:
-        # Vertical centering math
-        text_top = best_lines[0]["y"]
-        text_bottom = best_lines[-1]["y"] + best_lines[-1]["h"]
-        actual_text_height = text_bottom - text_top
-        v_shift = ((y2 - y1) // 2) - (text_top + (actual_text_height // 2))
+            # Otherwise start near top with small margin
+            v_shift = padding - first_y
 
         for line in best_lines:
-            # Measure exact text bounds to fix alignment
-            # bbox returns (left, top, right, bottom) relative to (0,0)
-            t_bbox = draw.textbbox((0, 0), line["text"], font=best_font)
-            t_w = t_bbox[2] - t_bbox[0]
-            t_offset_y = t_bbox[1]  # This is the 'drift' factor
-            
-            # Horizontal center within the strip
-            fx = x1 + line["x"] + (line["w"] - t_w) // 2
-            
-            # Vertical position: Strip Y + global Shift - the font's internal top offset
-            fy = y1 + line["y"] + v_shift - t_offset_y
-            
-            # --- DEBUG: DRAW TEXT STRIP BOXES (Cyan) ---
-            #strip_rect = [
-            #    x1 + line["x"], 
-            #    y1 + line["y"] + v_shift, 
-            #    x1 + line["x"] + line["w"], 
-            #    y1 + line["y"] + v_shift + line["h"]
-            #]
-            #draw.rectangle(strip_rect, outline="cyan", width=1)
-            
-            # Draw actual text with outline
+            line["y"] += v_shift
+
+    # ────────────────────────────────────────────────────────────────
+    #  Rendering
+    # ────────────────────────────────────────────────────────────────
+
+    # Optional debug: hull outline
+    # if hull is not None:
+    #     global_hull = hull + np.array([x1, y1])
+    #     draw.polygon([tuple(p) for p in global_hull], outline="magenta", width=2)
+
+    if not best_lines:
+        # Emergency fallback — very rare
+        draw.text((x1 + padding, y1 + padding), text, font=best_font, fill="black")
+    else:
+        for line in best_lines:
+            fx = x1 + line["x"]
+            fy = y1 + line["y"]
+
+            # White outline (stroke)
             for dx, dy in [(-1,-1), (1,-1), (-1,1), (1,1)]:
                 draw.text((fx+dx, fy+dy), line["text"], font=best_font, fill="white")
+            # Black text
             draw.text((fx, fy), line["text"], font=best_font, fill="black")
 
     return image
@@ -387,7 +415,8 @@ def process_single_page(input_path: str | Path, subdir: Path = None, font_size: 
             x1, y1, x2, y2 = map(int, result.boxes.xyxy[i])
             crop = image.crop((x1, y1, x2, y2))
 
-            raw_text = ocr_with_florence(crop)
+            # New: single call
+            raw_text, est_size = ocr_and_estimate_size(crop)
             if not raw_text.strip():
                 continue
 
@@ -397,8 +426,10 @@ def process_single_page(input_path: str | Path, subdir: Path = None, font_size: 
                 edited_image, result, input_path.name, i
             )
 
+            local_font_size = font_size if font_size is not None else 0.6 * est_size
+
             edited_image = overlay_text(
-                edited_image, translated, (x1, y1, x2, y2), bubble_mask, font_size=font_size
+                edited_image, translated, (x1, y1, x2, y2), bubble_mask, font_size=local_font_size
             )
 
     # Save
