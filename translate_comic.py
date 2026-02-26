@@ -27,7 +27,7 @@ OUTPUT_DIR   = BASE_DIR / "output"
 #YOLO_PATH    = MODEL_DIR / "comic-speech-bubble-detector.pt"
 YOLO_PATH    = MODEL_DIR / "yolov8m-seg-speech-bubble.pt"
 FONT_PATH    = FONT_DIR / "animeace2_reg.otf"
-FONT_SIZE    = 24               # adjust depending on your page resolution
+FONT_SIZE    = 12               # adjust depending on your page resolution
 MASK_DIR     = OUTPUT_DIR / "inspected_masks" # New directory for mask inspection
 
 FLORENCE_MODEL_ID = "microsoft/Florence-2-large"   # or "microsoft/Florence-2-base" for faster/less VRAM
