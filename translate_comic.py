@@ -159,22 +159,23 @@ def inpaint_bubble_text(image: Image.Image, result, page_name: str, index: int) 
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
     
     # Slightly higher threshold (150) to catch those "faint" smudges
-    _, dark_pixels = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    _, dark_pixels = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)
     
     # 3. Protect the Border & Isolate Text
     # We shrink the bubble area so the white paint never touches the black outline
-    border_protection = cv2.erode(full_mask, np.ones((9,9), np.uint8), iterations=2)
+    border_protection = cv2.erode(full_mask, np.ones((7,7), np.uint8), iterations=2)
     
     # Only target dark pixels inside the safe zone
     final_mask = cv2.bitwise_and(dark_pixels, border_protection)
     
     # 4. Expand and Feather (The "Smudge Killer")
     # We grow the mask to fully cover the text's anti-aliased edges
-    final_mask = cv2.dilate(final_mask, np.ones((5,5), np.uint8), iterations=2)
+    #final_mask = cv2.dilate(final_mask, np.ones((5,5), np.uint8), iterations=2)
+
     
     # Apply a Gaussian Blur to the mask to make the white fill blend softly
     # This prevents "harsh" white edges inside the bubble
-    mask_blurred = cv2.GaussianBlur(final_mask, (7, 7), 0)
+    mask_blurred = cv2.GaussianBlur(final_mask, (17, 17), 0)
 
     # Save for inspection
     #MASK_DIR.mkdir(exist_ok=True, parents=True)
