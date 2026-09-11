@@ -16,3 +16,4 @@ timm
 
 # Archive Handling
 patool
+pyside6>=6.7

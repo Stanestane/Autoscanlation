@@ -122,8 +122,16 @@ python translate_comic.py "input" --recursive --font-size 28
 python translate_comic.py "input/volume.cbr" --output-dir "output/trial"
 python -m unittest test_text_layout -v
 python preview_text_layout.py
+python gui.py
 ```
 
 The preview is saved to `output/text_layout_preview.png`. Tests and previews use
 Pillow, NumPy, and OpenCV without loading the detection/OCR models or contacting
 Google Translate. Pillow 10.1 or newer supports the scalable fallback font.
+
+## Desktop GUI
+
+Run `python gui.py` to open the cross-platform PySide6 interface. Choose an image
+or CBZ/CBR archive, set source and target languages, and click Translate. Model work
+runs in a background thread so the window remains responsive. Set `Sample pages` to
+a positive number for a quick archive test, or leave it at `All pages` for a volume.
