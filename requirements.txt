@@ -6,7 +6,7 @@ transformers
 einops
 
 # Image Processing
-pillow
+pillow>=10.1
 opencv-python-headless
 numpy
 

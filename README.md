@@ -104,4 +104,26 @@ You can adjust the following variables inside `translate_comic.py`:
 
 ---
 
-**Would you like me to add a "Troubleshooting" section to this README to help with common CUDA or Path errors?**
+## Text rendering
+
+The renderer in `text_layout.py` balances line breaks and centers the text within
+the detected bubble. It checks the entire text block against an inset segmentation
+mask, including concave edges, and reduces the font size when necessary. Oversized
+words can wrap across lines. If nothing fits at the minimum size, the original
+lettering is preserved. The current cleaning method paints white, so it works best
+with white speech bubbles.
+
+Use `--font-size 28` (or `-f 28`) to set a preferred maximum size. Text may shrink
+to fit; otherwise the starting size comes from Florence's estimate. Folder input
+is supported, with `--recursive` to include subfolders.
+
+```powershell
+python translate_comic.py "input" --recursive --font-size 28
+python translate_comic.py "input/volume.cbr" --output-dir "output/trial"
+python -m unittest test_text_layout -v
+python preview_text_layout.py
+```
+
+The preview is saved to `output/text_layout_preview.png`. Tests and previews use
+Pillow, NumPy, and OpenCV without loading the detection/OCR models or contacting
+Google Translate. Pillow 10.1 or newer supports the scalable fallback font.
