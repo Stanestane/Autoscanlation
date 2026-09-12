@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+from progress import report_progress
 
 ROOT = Path(__file__).parent
 OCR_MODEL = 'microsoft/Florence-2-large'
@@ -65,8 +66,9 @@ def write_json(path, data):
 
 class Pipeline:
     def __init__(self, cache_dir, source_lang='auto', target_lang='en', confidence=.2,
-                 detection_size=1536):
+                 detection_size=1536, progress_callback=None):
         self.cache_dir = Path(cache_dir)
+        self.progress_callback = progress_callback
         self.source_lang, self.target_lang = source_lang, target_lang
         self.confidence, self.detection_size = confidence, detection_size
         self.detector = self.model = self.processor = self.translator = None
@@ -76,6 +78,7 @@ class Pipeline:
     def load_models(self):
         if self.model is not None:
             return
+        report_progress(self, 'models', 'Loading detection and OCR models…')
         import torch
         from ultralytics import YOLO
         from transformers import AutoProcessor, AutoModelForCausalLM
@@ -87,6 +90,7 @@ class Pipeline:
         self.processor = AutoProcessor.from_pretrained(OCR_MODEL, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             OCR_MODEL, trust_remote_code=True, torch_dtype=self.dtype).to(self.device).eval()
+        report_progress(self, 'models', f'Models ready on {self.device.upper()}')
 
     def ocr(self, crop):
         # Add breathing room so glyphs at the crop boundary are not cut off.
@@ -98,6 +102,8 @@ class Pipeline:
                       pixel_values=inputs['pixel_values'].to(self.device, dtype=self.dtype),
                       num_beams=3, do_sample=False)
         for limit in (1024, 2048):
+            if limit == 2048:
+                report_progress(self, 'ocr', 'Retrying incomplete OCR with a larger token limit')
             with self.torch.inference_mode():
                 generated = self.model.generate(**kwargs, max_new_tokens=limit)
             ids = generated[0].tolist()
@@ -143,11 +149,13 @@ class Pipeline:
         cache_path = self.cache_dir / 'pages' / f'{key}.json'
         cached = read_json(cache_path)
         if cached and cached.get('finished'):
+            report_progress(self, 'cache', f'Reusing cached OCR: {Path(path).name}')
             print(f'  Reusing OCR: {Path(path).name}', flush=True)
             for bubble in cached['bubbles']:
                 bubble['ocr'] = normalize_regions(bubble['ocr'])
             return image, cached
         self.load_models()
+        report_progress(self, 'detection', 'Detecting speech bubbles and narration boxes…')
         results = []
         for scale in dict.fromkeys((self.detection_size, 640)):
             results.extend(self.detector(image, imgsz=scale, conf=self.confidence,
@@ -201,6 +209,8 @@ class Pipeline:
             if existing.get('sha256') == signature:
                 previous.extend(existing.get('bubbles', []))
         for index, bubble in enumerate(bubbles):
+            report_progress(self, 'ocr', f'Reading bubble {index + 1} of {len(bubbles)}',
+                            completed=index, total=len(bubbles))
             reused = next((old for old in previous if old['box'] == bubble['box']
                            and old.get('ocr', {}).get('raw', '').endswith('</s>')
                            and old['ocr']['tokens'] < 1024), None)
@@ -222,6 +232,8 @@ class Pipeline:
             write_json(cache_path, report)
         report['finished'] = True
         write_json(cache_path, report)
+        report_progress(self, 'ocr', f'OCR complete: {len(bubbles)} regions',
+                        completed=len(bubbles), total=len(bubbles))
         return image, report
 
     def translate(self, text):
@@ -245,5 +257,6 @@ class Pipeline:
                 return result.text.strip()
             except Exception as exc:
                 last_error = exc
+                report_progress(self, 'retry', f'Translation attempt {attempt + 1} failed: {exc}')
                 time.sleep(attempt + 1)
         raise RuntimeError(f'Translation failed: {last_error}')

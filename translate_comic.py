@@ -9,6 +9,7 @@ from pathlib import Path
 from bubble_cleaning import bubble_mask, clean_bubble
 from comic_pipeline import Pipeline, ROOT, write_json
 from text_layout import layout_text, draw_layout
+from progress import report_progress
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.tif', '.tiff'}
 ARCHIVE_EXTENSIONS = {'.cbz', '.cbr'}
@@ -20,10 +21,13 @@ def natural_key(value):
 
 
 def process_page(input_path, output_path, pipeline, font_size=None):
+    report_progress(pipeline, 'page_start', f'Opening {Path(input_path).name}')
     image, analysis = pipeline.analyze(input_path)
     report = copy.deepcopy(analysis)
     edited = image.copy()
     for index, bubble in enumerate(report['bubbles']):
+        report_progress(pipeline, 'render', f'Translating and rendering bubble {index + 1} of {len(report["bubbles"])}',
+                        completed=index, total=len(report['bubbles']))
         ocr = bubble['ocr']
         text = ocr['text']
         if not ocr['complete']:
@@ -60,14 +64,18 @@ def process_page(input_path, output_path, pipeline, font_size=None):
                           font_size=layout.font_size, cleaning=cleaning)
         except Exception as exc:
             bubble.update(status='error', error=str(exc))
+            report_progress(pipeline, 'warning', f'Bubble {index+1}: {exc}')
             print(f'  Bubble {index+1}: {exc}', flush=True)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    report_progress(pipeline, 'save', f'Saving {output_path.name}')
     edited.save(output_path, format='PNG')
     report['output'] = str(output_path)
     report['summary'] = {status: sum(b.get('status') == status for b in report['bubbles'])
                          for status in sorted({b['status'] for b in report['bubbles']})}
     write_json(output_path.with_suffix('.json'), report)
+    report_progress(pipeline, 'page_saved', f'Saved {output_path.name}',
+                    output=str(output_path), summary=report['summary'])
     print(f"  Saved {output_path.name}: {report['summary']}", flush=True)
     return report
 
@@ -77,12 +85,15 @@ def process_archive(archive_path, output_dir, pipeline, font_size=None, max_page
     archive_path, output_dir = Path(archive_path), Path(output_dir)
     with tempfile.TemporaryDirectory(prefix='comic_translation_') as temporary:
         extraction = Path(temporary)
+        report_progress(pipeline, 'extract', f'Extracting {archive_path.name}…')
         patoolib.extract_archive(str(archive_path.resolve()), outdir=str(extraction), verbosity=-1)
         pages = sorted((p for p in extraction.rglob('*') if p.is_file()
                         and p.suffix.lower() in IMAGE_EXTENSIONS), key=natural_key)
         if not pages:
             raise ValueError(f'No supported images in {archive_path.name}')
         selected = pages[:max_pages] if max_pages else pages
+        report_progress(pipeline, 'pages', f'Found {len(selected)} pages to process',
+                        completed=0, total=len(selected))
         stage = output_dir / archive_path.stem
         packed, reports = [], []
         for index, page in enumerate(selected, 1):
@@ -96,6 +107,7 @@ def process_archive(archive_path, output_dir, pipeline, font_size=None, max_page
         suffix = '_sample' if max_pages and len(selected) < len(pages) else ''
         output_cbz = output_dir / f'{archive_path.stem}{suffix}_[{pipeline.target_lang}].cbz'
         temporary_cbz = output_cbz.with_suffix('.cbz.tmp')
+        report_progress(pipeline, 'pack', 'Creating CBZ archive…')
         with zipfile.ZipFile(temporary_cbz, 'w', zipfile.ZIP_DEFLATED) as archive:
             for path, name in packed:
                 archive.write(path, name)
@@ -103,6 +115,7 @@ def process_archive(archive_path, output_dir, pipeline, font_size=None, max_page
                 for extra in extraction.rglob('*'):
                     if extra.is_file() and extra.suffix.lower() not in IMAGE_EXTENSIONS:
                         archive.write(extra, extra.relative_to(extraction).as_posix())
+        report_progress(pipeline, 'verify', 'Checking CBZ archive integrity…')
         with zipfile.ZipFile(temporary_cbz) as archive:
             if archive.testzip() is not None:
                 raise IOError('Output archive failed its integrity check')
